@@ -2,6 +2,7 @@
 
 import { useEffect, useRef, useState, useCallback } from 'react';
 import Link from 'next/link';
+import Image from 'next/image';
 import { Phone, PhoneOff, Mic, MicOff, SkipForward, Loader2, Send, User, Globe, X } from 'lucide-react';
 
 // WebSocket server URL - use environment variable or fallback to localhost
@@ -79,6 +80,32 @@ const PROGRAM_OPTIONS_MAP: Record<string, { value: string; label: string }[]> = 
   ],
 };
 
+// Helper function to format field names
+const formatFieldName = (field: string): string => {
+  const fieldMap: Record<string, string> = {
+    'stem': 'STEM',
+    'humanities': 'Humanities',
+    'social-sciences': 'Social Sciences',
+    'business': 'Business',
+    'arts': 'Arts & Design',
+    'health': 'Health Sciences',
+    'other': 'Other',
+  };
+  return fieldMap[field] || field;
+};
+
+// Helper function to format year level
+const formatYearLevel = (year: string): string => {
+  const yearMap: Record<string, string> = {
+    '1st': '1st Year',
+    '2nd': '2nd Year',
+    '3rd': '3rd Year',
+    '4th': '4th Year',
+    '5th': '5th Year',
+  };
+  return yearMap[year] || year;
+};
+
 export default function Home() {
   const [userId] = useState(() => `user_${Math.random().toString(36).substr(2, 9)}`);
   const [connectionState, setConnectionState] = useState<ConnectionState>('disconnected');
@@ -100,6 +127,10 @@ export default function Home() {
   const [remoteUserInfo, setRemoteUserInfo] = useState<UserInfo | null>(null);
   const [disconnectNotification, setDisconnectNotification] = useState<boolean>(false);
   const chatDeleteTimerRef = useRef<NodeJS.Timeout | null>(null);
+  const heartbeatTimerRef = useRef<number | null>(null);
+  const reconnectAttemptsRef = useRef<number>(0);
+  const maxReconnectAttempts = 5;
+  const baseReconnectDelay = 1000; // 1 second
   
   const wsRef = useRef<WebSocket | null>(null);
   const peerConnectionRef = useRef<RTCPeerConnection | null>(null);
@@ -213,6 +244,32 @@ export default function Home() {
     setMessages(prev => [...prev, newMessage]);
   };
 
+  // Calculate exponential backoff delay for reconnection
+  const getReconnectDelay = (attempt: number): number => {
+    return Math.min(baseReconnectDelay * Math.pow(2, attempt), 30000); // Max 30 seconds
+  };
+
+  // Heartbeat mechanism for connection health monitoring
+  const startHeartbeat = useCallback(() => {
+    if (heartbeatTimerRef.current) clearInterval(heartbeatTimerRef.current);
+    
+    heartbeatTimerRef.current = window.setInterval(() => {
+      if (wsRef.current?.readyState === WebSocket.OPEN) {
+        wsRef.current.send(JSON.stringify({
+          type: 'heartbeat',
+          timestamp: Date.now()
+        }));
+      }
+    }, 30000); // Send heartbeat every 30 seconds
+  }, []);
+
+  const stopHeartbeat = useCallback(() => {
+    if (heartbeatTimerRef.current) {
+      clearInterval(heartbeatTimerRef.current);
+      heartbeatTimerRef.current = null;
+    }
+  }, []);
+
   // Initialize WebSocket connection
   const initializeWebSocket = useCallback(function initializeWebSocket() {
     if (wsRef.current?.readyState === WebSocket.OPEN) return;
@@ -222,11 +279,14 @@ export default function Home() {
 
     ws.onopen = () => {
       console.log('WebSocket connected');
+      reconnectAttemptsRef.current = 0; // Reset reconnect attempts on successful connection
       setError(null);
+      startHeartbeat();
     };
 
     ws.onmessage = async (event) => {
-      const message = JSON.parse(event.data);
+      try {
+        const message = JSON.parse(event.data);
       console.log('Received message:', message.type);
 
       switch (message.type) {
@@ -277,25 +337,45 @@ export default function Home() {
         case 'online_count':
           setOnlineCount(message.count);
           break;
+
+        case 'heartbeat':
+          console.log('Heartbeat acknowledged');
+          break;
+        }
+      } catch (error) {
+        console.error('Error processing message:', error);
       }
     };
 
     ws.onerror = (error) => {
       console.error('WebSocket error:', error);
-      setError('Connection error. Please try again.');
+      setError('Connection error. Attempting to reconnect...');
       setConnectionState('disconnected');
+      stopHeartbeat();
     };
 
     ws.onclose = () => {
       console.log('WebSocket disconnected');
+      stopHeartbeat();
       setConnectionState('disconnected');
-      setTimeout(() => {
-        if (connectionState !== 'disconnected') {
-          initializeWebSocket();
-        }
-      }, 3000);
+      
+      // Auto-reconnect with exponential backoff
+      if (reconnectAttemptsRef.current < maxReconnectAttempts) {
+        const delay = getReconnectDelay(reconnectAttemptsRef.current);
+        console.log(`Attempting reconnect in ${delay}ms (attempt ${reconnectAttemptsRef.current + 1}/${maxReconnectAttempts})`);
+        reconnectAttemptsRef.current++;
+        
+        setTimeout(() => {
+          if (connectionState !== 'disconnected' || wsRef.current?.readyState !== WebSocket.OPEN) {
+            initializeWebSocket();
+          }
+        }, delay);
+      } else {
+        setError('Connection failed after maximum attempts. Please refresh the page.');
+      }
     };
-  }, [userId, connectionState]);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [userId, connectionState, startHeartbeat, stopHeartbeat, getReconnectDelay]);
 
   // Get user media (microphone)
   async function getUserMedia() {
@@ -332,6 +412,33 @@ export default function Home() {
     localAnalyserRef.current = analyser;
     
     detectLocalAudio();
+  };
+
+  // Detect remote audio levels (moved before useEffect that depends on it)
+  const detectRemoteAudio = () => {
+    if (!remoteAnalyserRef.current) return;
+    
+    const analyser = remoteAnalyserRef.current;
+    const bufferLength = analyser.frequencyBinCount;
+    const dataArray = new Uint8Array(bufferLength);
+    
+    const checkAudio = () => {
+      if (connectionState !== 'connected') {
+        setIsRemoteTalking(false);
+        return;
+      }
+      
+      analyser.getByteFrequencyData(dataArray);
+      
+      const average = dataArray.reduce((a, b) => a + b) / bufferLength;
+      const threshold = 10; // Lower threshold = more sensitive
+      
+      setIsRemoteTalking(average > threshold);
+      
+      requestAnimationFrame(checkAudio);
+    };
+    
+    checkAudio();
   };
 
   // Detect local audio levels
@@ -384,33 +491,6 @@ export default function Home() {
     detectRemoteAudio();
   };
 
-  // Detect remote audio levels
-  const detectRemoteAudio = () => {
-    if (!remoteAnalyserRef.current) return;
-    
-    const analyser = remoteAnalyserRef.current;
-    const bufferLength = analyser.frequencyBinCount;
-    const dataArray = new Uint8Array(bufferLength);
-    
-    const checkAudio = () => {
-      if (connectionState !== 'connected') {
-        setIsRemoteTalking(false);
-        return;
-      }
-      
-      analyser.getByteFrequencyData(dataArray);
-      
-      const average = dataArray.reduce((a, b) => a + b) / bufferLength;
-      const threshold = 10; // Lower threshold = more sensitive
-      
-      setIsRemoteTalking(average > threshold);
-      
-      requestAnimationFrame(checkAudio);
-    };
-    
-    checkAudio();
-  };
-
   // Create peer connection
   function createPeerConnection() {
     const pc = new RTCPeerConnection(ICE_SERVERS);
@@ -457,13 +537,39 @@ export default function Home() {
     return pc;
   }
 
+  // Sanitize chat input to prevent XSS
+  const sanitizeChatInput = (input: string): string => {
+    return input
+      .replace(/[<>"'&]/g, (char) => {
+        const escapeMap: { [key: string]: string } = {
+          '<': '&lt;',
+          '>': '&gt;',
+          '"': '&quot;',
+          "'": '&#x27;',
+          '&': '&amp;'
+        };
+        return escapeMap[char] || char;
+      })
+      .substring(0, 500); // Max 500 chars per message
+  };
+
+  // Sanitize nickname input
+  const sanitizeNickname = (input: string): string => {
+    return input
+      .replace(/[<>"'&]/g, '')
+      .replace(/[^a-zA-Z0-9\s\-_]/g, '')
+      .trim()
+      .substring(0, 20);
+  };
+
   // Send chat message
   const sendMessage = () => {
-    if (!messageInput.trim() || connectionState !== 'connected') return;
+    const sanitizedMessage = sanitizeChatInput(messageInput.trim());
+    if (!sanitizedMessage || connectionState !== 'connected') return;
 
     const newMessage: ChatMessage = {
       id: Date.now().toString(),
-      text: messageInput,
+      text: sanitizedMessage,
       isMine: true,
       timestamp: new Date(),
     };
@@ -474,7 +580,7 @@ export default function Home() {
       wsRef.current.send(
         JSON.stringify({
           type: 'chat_message',
-          message: messageInput,
+          message: sanitizedMessage,
         })
       );
     }
@@ -495,12 +601,43 @@ export default function Home() {
     chatEndRef.current?.scrollIntoView({ behavior: 'smooth' });
   }, [messages]);
 
+  // Detect network changes for connection restoration
+  useEffect(() => {
+    const handleOnline = () => {
+      console.log('Network restored');
+      setError(null);
+      if (wsRef.current?.readyState !== WebSocket.OPEN) {
+        reconnectAttemptsRef.current = 0;
+        initializeWebSocket();
+      }
+    };
+
+    const handleOffline = () => {
+      console.log('Network lost');
+      setError('No internet connection. Waiting for network restoration...');
+    };
+
+    window.addEventListener('online', handleOnline);
+    window.addEventListener('offline', handleOffline);
+
+    return () => {
+      window.removeEventListener('online', handleOnline);
+      window.removeEventListener('offline', handleOffline);
+    };
+  }, [initializeWebSocket]);
+
   // Start call - find a match
   const startCall = () => {
     const selectedProgram = program === 'Other' ? otherProgram.trim() : program;
+    const cleanedNickname = sanitizeNickname(nickname);
 
     if (!field || !selectedProgram || !yearLevel) {
       setError('Please select your field, program, and year level before starting a call');
+      return;
+    }
+
+    if (!cleanedNickname || cleanedNickname.length < 2) {
+      setError('Nickname must be at least 2 characters');
       return;
     }
 
@@ -518,7 +655,7 @@ export default function Home() {
       program: selectedProgram,
       year_level: yearLevel,
       interests: interests,
-      nickname: nickname || 'Anonymous',
+      nickname: cleanedNickname,
     }));
   };
 
@@ -547,6 +684,10 @@ export default function Home() {
     setConnectionState('disconnected');
     setRemoteUserInfo(null);
     setDisconnectNotification(true);
+    if (heartbeatTimerRef.current) {
+      clearInterval(heartbeatTimerRef.current);
+      heartbeatTimerRef.current = null;
+    }
     
     // Clear existing timer if any
     if (chatDeleteTimerRef.current) {
@@ -576,11 +717,16 @@ export default function Home() {
     setIsLocalTalking(false);
     setIsRemoteTalking(false);
     
-    // Clear timer
+    // Clear timers
     if (chatDeleteTimerRef.current) {
       clearTimeout(chatDeleteTimerRef.current);
       chatDeleteTimerRef.current = null;
     }
+    if (heartbeatTimerRef.current) {
+      clearInterval(heartbeatTimerRef.current);
+      heartbeatTimerRef.current = null;
+    }
+    reconnectAttemptsRef.current = 0;
     
     // Cleanup audio contexts
     if (localAudioContextRef.current) {
@@ -612,6 +758,7 @@ export default function Home() {
     return () => {
       endCall();
     };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
   return (
@@ -619,9 +766,11 @@ export default function Home() {
       {/* Header */}
       <header className="w-full flex flex-wrap md:flex-nowrap justify-between items-center gap-2 md:gap-0 px-8 py-6 border-b border-[#ff6b35]/20">
         <div className="flex items-center gap-3 flex-wrap">
-          <img
+          <Image
             src="/HeaderLogo.png"
             alt="SYNCED"
+            width={180}
+            height={48}
             className="h-10 w-auto object-contain md:h-12"
             style={{ maxWidth: '180px' }}
           />
@@ -680,9 +829,11 @@ export default function Home() {
           style={{ animation: 'heroFadeUp 0.6s 0.05s ease both', opacity: 0 }}
           className="mb-4"
         >
-          <img
+          <Image
             src="/Wordmark.svg"
             alt="SYNCED"
+            width={112}
+            height={112}
             className="h-20 md:h-28 w-auto mx-auto"
           />
         </div>
@@ -844,12 +995,12 @@ export default function Home() {
                       )}
                     </div>
                     <div className="text-center">
-                      <span className="text-white/80 text-sm font-medium block">{remoteUserInfo?.nickname || 'Buddy'}</span>
+                      <span className="text-white/90 text-sm font-semibold block mb-2">&quot;{remoteUserInfo?.nickname || 'Buddy'}&quot;</span>
                       {remoteUserInfo && (
-                        <>
-                          <span className="text-white/60 text-xs block">{remoteUserInfo.field}</span>
-                          <span className="text-white/60 text-xs block">Year {remoteUserInfo.yearLevel}</span>
-                        </>
+                        <div className="text-white/70 text-xs space-y-1">
+                          <div>Program: <span className="text-white/90 font-medium">{formatFieldName(remoteUserInfo.field)}</span></div>
+                          <div>Year: <span className="text-white/90 font-medium">{formatYearLevel(remoteUserInfo.yearLevel)}</span></div>
+                        </div>
                       )}
                     </div>
                   </div>
@@ -886,7 +1037,7 @@ export default function Home() {
                 onClick={startCall}
                 className="w-full max-w-sm md:w-auto px-8 py-4 bg-gradient-to-r from-[#ff6b35] to-[#ff8a5a] hover:from-[#ff8a5a] hover:to-[#ffaa7a] text-white rounded-full font-bold transition-all flex items-center justify-center gap-3 text-lg shadow-lg shadow-[#ff6b35]/40 hover:shadow-[#ff6b35]/60 hover:scale-105"
               >
-                <img src="/syncedIcon.svg" alt="Sync" className="w-10 h-8" />
+                <Image src="/syncedIcon.svg" alt="Sync" width={40} height={32} />
                 Sync Now
               </button>
             ) : (
