@@ -135,6 +135,7 @@ export default function Home() {
   const remoteAudioContextRef = useRef<AudioContext | null>(null);
   const localAnalyserRef = useRef<AnalyserNode | null>(null);
   const remoteAnalyserRef = useRef<AnalyserNode | null>(null);
+  const iceCandidateBufferRef = useRef<RTCIceCandidateInit[]>([]);
 
   // Handle match found
   const handleMatchFound = async () => {
@@ -182,6 +183,9 @@ export default function Home() {
           data: answer,
         })
       );
+
+      // Process any buffered ICE candidates
+      await processBufferedIceCandidates();
     } catch (err) {
       console.error('Error handling offer:', err);
     }
@@ -193,6 +197,8 @@ export default function Home() {
       await peerConnectionRef.current?.setRemoteDescription(
         new RTCSessionDescription(answer)
       );
+      // Process any buffered ICE candidates
+      await processBufferedIceCandidates();
     } catch (err) {
       console.error('Error handling answer:', err);
     }
@@ -201,11 +207,33 @@ export default function Home() {
   // Handle ICE candidate
   const handleIceCandidate = async (candidate: RTCIceCandidateInit) => {
     try {
-      await peerConnectionRef.current?.addIceCandidate(
-        new RTCIceCandidate(candidate)
-      );
+      const pc = peerConnectionRef.current;
+      if (!pc) return;
+
+      // Check if remote description is set
+      if (!pc.remoteDescription) {
+        // Buffer the candidate until remote description is set
+        iceCandidateBufferRef.current.push(candidate);
+        console.log('ICE candidate buffered, waiting for remote description');
+        return;
+      }
+
+      await pc.addIceCandidate(new RTCIceCandidate(candidate));
     } catch (err) {
-      console.error('Error handling ICE candidate:', err);
+      // Ignore candidates that fail to add (connection might be closed)
+      if (err instanceof Error && err.name !== 'InvalidStateError') {
+        console.error('Error handling ICE candidate:', err);
+      }
+    }
+  };
+
+  // Process buffered ICE candidates
+  const processBufferedIceCandidates = async () => {
+    const buffered = iceCandidateBufferRef.current;
+    iceCandidateBufferRef.current = [];
+
+    for (const candidate of buffered) {
+      await handleIceCandidate(candidate);
     }
   };
 
