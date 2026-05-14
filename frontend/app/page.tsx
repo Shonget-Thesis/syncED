@@ -107,10 +107,11 @@ export default function Home() {
   useEffect(() => {
     const wakeUpBackend = async () => {
       try {
-        const backendUrl = (process.env.NEXT_PUBLIC_WS_URL || 'ws://localhost:8000')
+        let backendUrl = (process.env.NEXT_PUBLIC_WS_URL || 'ws://localhost:8000')
           .replace('ws://', 'http://')
           .replace('wss://', 'https://')
-          .replace(/\/ws\/?$/, '');
+          .replace(/\/ws\/?$/, '')
+          .replace(/\/$/, ''); // Remove trailing slash if any
         
         const response = await fetch(`${backendUrl}/`);
         console.log('Backend woken up:', response.status);
