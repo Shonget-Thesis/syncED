@@ -89,6 +89,30 @@ export default function Home() {
   const [showFireAnimation, setShowFireAnimation] = useState(false);
   
   const wsRef = useRef<WebSocket | null>(null);
+
+  // Wake up backend on page load to prevent Render spin-down
+  useEffect(() => {
+    const wakeUpBackend = async () => {
+      try {
+        const backendUrl = (process.env.NEXT_PUBLIC_WS_URL || 'ws://localhost:8000')
+          .replace('ws://', 'http://')
+          .replace('wss://', 'https://')
+          .replace(/\/ws\/?$/, '');
+        
+        const response = await fetch(`${backendUrl}/`);
+        console.log('Backend woken up:', response.status);
+      } catch (err) {
+        console.log('Backend wake-up fetch (non-critical):', err);
+      }
+    };
+
+    wakeUpBackend();
+
+    // Keep backend alive with periodic fetches every 5 minutes
+    const keepAliveInterval = setInterval(wakeUpBackend, 5 * 60 * 1000);
+
+    return () => clearInterval(keepAliveInterval);
+  }, []);
   const peerConnectionRef = useRef<RTCPeerConnection | null>(null);
   const localStreamRef = useRef<MediaStream | null>(null);
   const remoteAudioRef = useRef<HTMLAudioElement>(null);
