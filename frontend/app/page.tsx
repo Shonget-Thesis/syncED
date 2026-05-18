@@ -394,6 +394,9 @@ export default function Home() {
         case 'heartbeat':
           console.log('Heartbeat acknowledged');
           break;
+        case 'error':
+          setError(message.message || 'Server error');
+          break;
         }
       } catch (error) {
         console.error('Error processing message:', error);
@@ -419,7 +422,7 @@ export default function Home() {
         reconnectAttemptsRef.current++;
         
         setTimeout(() => {
-          if (connectionState !== 'disconnected' || wsRef.current?.readyState !== WebSocket.OPEN) {
+          if (wsRef.current?.readyState !== WebSocket.OPEN) {
             initializeWebSocket();
           }
         }, delay);

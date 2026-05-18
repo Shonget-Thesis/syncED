@@ -300,8 +300,8 @@ async def websocket_endpoint(websocket: WebSocket, user_id: str):
             
             print(f"Received from {user_id}: {message_type}")
             
-            # Check rate limit for all messages except heartbeat
-            if message_type != "heartbeat" and not manager.check_rate_limit(user_id):
+            # Check rate limit for non-signaling messages
+            if message_type not in ["heartbeat", "offer", "answer", "ice_candidate"] and not manager.check_rate_limit(user_id):
                 await manager.send_to_user(user_id, {
                     "type": "error",
                     "message": "Message rate limit exceeded. Please slow down.",
